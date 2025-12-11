@@ -247,14 +247,17 @@ class WandbInspector:
     def get_runs(
         self,
         filters: Optional[dict] = None,
+        config_filters: Optional[dict[str, list[str]]] = None,
         deduplicate: bool = True,
         refresh: bool = False,
     ) -> list[CachedRun]:
         """
-        Get runs, optionally deduplicated.
+        Get runs, optionally filtered and deduplicated.
 
         Args:
-            filters: Wandb filters (only used when refresh=True)
+            filters: Wandb API filters (only used when refresh=True)
+            config_filters: Filter runs by config values. Dict mapping key -> list of acceptable values.
+                           Multiple keys are AND, multiple values per key are OR.
             deduplicate: Whether to deduplicate runs
             refresh: Force refresh from wandb API
 
@@ -263,9 +266,30 @@ class WandbInspector:
         """
         runs = self.fetch_runs(filters=filters, refresh=refresh)
 
+        # Apply config filters
+        if config_filters:
+            filtered = []
+            for run in runs:
+                config = run.config if isinstance(run.config, dict) else {}
+                match = True
+                for key, values in config_filters.items():
+                    run_value = config.get(key)
+                    run_value_str = str(run_value) if run_value is not None else None
+                    if run_value_str not in values:
+                        match = False
+                        break
+                if match:
+                    filtered.append(run)
+            runs = filtered
+
         # Skip deduplication if not requested or no keys configured
         if not deduplicate or not self.dedup_config.keys:
             return runs
+
+        # When config_filters are applied, always re-deduplicate
+        if config_filters:
+            deduped, _ = self.deduplicator.deduplicate(runs)
+            return deduped if deduped else runs
 
         if self._deduped_runs is None:
             self._deduped_runs, self._duplicate_groups = self.deduplicator.deduplicate(runs)
@@ -397,6 +421,7 @@ class WandbInspector:
         metric_keys: list[str],
         config_keys: Optional[list[str]] = None,
         group_by: Optional[str] = None,
+        config_filters: Optional[dict[str, list[str]]] = None,
         deduplicate: bool = True,
         refresh: bool = False,
     ) -> AggregatedReport:
@@ -407,13 +432,16 @@ class WandbInspector:
             metric_keys: Metrics to aggregate
             config_keys: Config keys to track
             group_by: Config key to group by
+            config_filters: Filter runs by config values
             deduplicate: Use deduplicated runs
             refresh: Force refresh from wandb API
 
         Returns:
             AggregatedReport object
         """
-        runs = self.get_runs(deduplicate=deduplicate, refresh=refresh)
+        runs = self.get_runs(
+            config_filters=config_filters, deduplicate=deduplicate, refresh=refresh
+        )
         generator = ReportGenerator(runs)
         return generator.generate_aggregated_report(
             metric_keys=metric_keys,
@@ -425,6 +453,7 @@ class WandbInspector:
         self,
         metric_keys: Optional[list[str]] = None,
         config_keys: Optional[list[str]] = None,
+        config_filters: Optional[dict[str, list[str]]] = None,
         deduplicate: bool = True,
         refresh: bool = False,
     ) -> list:
@@ -434,13 +463,16 @@ class WandbInspector:
         Args:
             metric_keys: Metrics to include
             config_keys: Config keys to include
+            config_filters: Filter runs by config values
             deduplicate: Use deduplicated runs
             refresh: Force refresh from wandb API
 
         Returns:
             List of RunReport objects
         """
-        runs = self.get_runs(deduplicate=deduplicate, refresh=refresh)
+        runs = self.get_runs(
+            config_filters=config_filters, deduplicate=deduplicate, refresh=refresh
+        )
         generator = ReportGenerator(runs)
         return generator.generate_run_reports(
             metric_keys=metric_keys,
@@ -639,6 +671,7 @@ class WandbInspector:
         self,
         metric_keys: Optional[list[str]] = None,
         config_keys: Optional[list[str]] = None,
+        config_filters: Optional[dict[str, list[str]]] = None,
         deduplicate: bool = True,
         refresh: bool = False,
     ):
@@ -648,6 +681,7 @@ class WandbInspector:
         Args:
             metric_keys: Metrics to include
             config_keys: Config keys to include
+            config_filters: Filter runs by config values
             deduplicate: Use deduplicated runs
             refresh: Force refresh from wandb API
 
@@ -659,6 +693,7 @@ class WandbInspector:
         reports = self.run_reports(
             metric_keys=metric_keys,
             config_keys=config_keys,
+            config_filters=config_filters,
             deduplicate=deduplicate,
             refresh=refresh,
         )

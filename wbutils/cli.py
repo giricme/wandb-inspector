@@ -9,6 +9,171 @@ from .discovery import MetricSource
 from .inspector import WandbInspector
 
 
+def parse_filters(filter_args: list[str] | None) -> dict[str, list[str]]:
+    """
+    Parse filter arguments into a dict.
+
+    Args:
+        filter_args: List of "key=value" or "key=val1,val2" strings
+
+    Returns:
+        Dict mapping key -> list of acceptable values
+    """
+    if not filter_args:
+        return {}
+
+    filters = {}
+    for f in filter_args:
+        if "=" not in f:
+            print(f"Warning: Invalid filter '{f}' (expected key=value)")
+            continue
+        key, value = f.split("=", 1)
+        # Support comma-separated values for OR
+        values = [v.strip() for v in value.split(",")]
+        filters[key] = values
+    return filters
+
+
+def apply_filters(
+    runs: list, filters: dict[str, list[str]], show_debug_on_empty: bool = True
+) -> list:
+    """
+    Filter runs by config values.
+
+    Args:
+        runs: List of CachedRun objects
+        filters: Dict mapping key -> list of acceptable values (AND between keys, OR within values)
+        show_debug_on_empty: Show debug info if no runs match
+
+    Returns:
+        Filtered list of runs
+    """
+    if not filters:
+        return runs
+
+    filtered = []
+    for run in runs:
+        config = run.config if isinstance(run.config, dict) else {}
+        match = True
+        for key, values in filters.items():
+            run_value = config.get(key)
+            # Convert to string for comparison
+            run_value_str = str(run_value) if run_value is not None else None
+            if run_value_str not in values:
+                match = False
+                break
+        if match:
+            filtered.append(run)
+
+    # Debug output if no matches
+    if not filtered and show_debug_on_empty and runs:
+        print(f"\nWarning: Filter matched 0/{len(runs)} runs")
+        print("Filter debug:")
+        for key, filter_values in filters.items():
+            # Collect actual values for this key
+            actual_values = set()
+            missing_count = 0
+            for run in runs:
+                config = run.config if isinstance(run.config, dict) else {}
+                if key in config:
+                    val = config[key]
+                    actual_values.add(str(val) if val is not None else None)
+                else:
+                    missing_count += 1
+
+            if missing_count == len(runs):
+                print(f"  {key}: KEY NOT FOUND in any run config")
+                # Suggest similar keys
+                all_keys = set()
+                for run in runs:
+                    config = run.config if isinstance(run.config, dict) else {}
+                    all_keys.update(config.keys())
+                similar = [
+                    k for k in all_keys if key.lower() in k.lower() or k.lower() in key.lower()
+                ]
+                if similar:
+                    print(f"    Similar keys: {similar}")
+            else:
+                actual_list = sorted([v for v in actual_values if v is not None])[:10]
+                print(f"  {key}: filter={filter_values}")
+                print(
+                    f"    actual values: {actual_list}"
+                    + (" ..." if len(actual_values) > 10 else "")
+                )
+                # Check for near matches
+                for fv in filter_values:
+                    near = [
+                        av for av in actual_values if av and fv.lower() == av.lower() and fv != av
+                    ]
+                    if near:
+                        print(f"    Did you mean '{near[0]}' instead of '{fv}'?")
+        print()
+
+    return filtered
+
+
+def parse_metric_maps(metric_map_args: list[str] | None) -> dict[str, dict[str, str]]:
+    """
+    Parse metric mapping arguments.
+
+    Formats:
+        LABEL=alt_metric           -> {LABEL: {None: alt_metric}} (single metric mode)
+        LABEL:canonical=actual     -> {LABEL: {canonical: actual}} (multi-metric mode)
+
+    Args:
+        metric_map_args: List of mapping strings
+
+    Returns:
+        Dict mapping label -> {canonical_metric: actual_metric}
+    """
+    if not metric_map_args:
+        return {}
+
+    mappings = {}  # label -> {canonical: actual}
+
+    for m in metric_map_args:
+        if ":" in m and "=" in m:
+            # Format: LABEL:canonical=actual
+            label_part, mapping_part = m.split(":", 1)
+            if "=" in mapping_part:
+                canonical, actual = mapping_part.split("=", 1)
+                if label_part not in mappings:
+                    mappings[label_part] = {}
+                mappings[label_part][canonical] = actual
+        elif "=" in m:
+            # Format: LABEL=alt_metric (single metric mode - use None as key)
+            label, actual = m.split("=", 1)
+            if label not in mappings:
+                mappings[label] = {}
+            mappings[label][None] = actual
+        else:
+            print(
+                f"Warning: Invalid metric-map format '{m}' (expected LABEL=metric or LABEL:canonical=actual)"
+            )
+
+    return mappings
+
+
+def get_mapped_metric(
+    label: str, canonical_metric: str, metric_maps: dict, metrics: list[str]
+) -> str:
+    """Get the actual metric name for a project, considering mappings."""
+    if label not in metric_maps:
+        return canonical_metric
+
+    label_maps = metric_maps[label]
+
+    # Check for specific mapping
+    if canonical_metric in label_maps:
+        return label_maps[canonical_metric]
+
+    # Check for single-metric mode (None key)
+    if None in label_maps and len(metrics) == 1:
+        return label_maps[None]
+
+    return canonical_metric
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Inspect wandb projects: discover metrics, deduplicate runs, generate reports.",
@@ -40,6 +205,13 @@ Examples:
             p.add_argument("project", help="Wandb project name")
         p.add_argument("--cache-dir", help="Directory to cache data (default: .cache/wbutils)")
         p.add_argument("--no-cache", action="store_true", help="Disable caching")
+        p.add_argument(
+            "--filter",
+            action="append",
+            dest="filters",
+            metavar="KEY=VALUE",
+            help="Filter runs by config (e.g., --filter env_name=square). Use comma for OR: key=a,b. Repeat for AND.",
+        )
         p.add_argument(
             "--dedup-keys",
             nargs="+",
@@ -157,6 +329,13 @@ Examples:
     )
     plot_parser.add_argument("--no-cache", action="store_true", help="Disable caching")
     plot_parser.add_argument(
+        "--filter",
+        action="append",
+        dest="filters",
+        metavar="KEY=VALUE",
+        help="Filter runs by config (e.g., --filter env_name=square). Repeat for AND.",
+    )
+    plot_parser.add_argument(
         "--dedup-keys", nargs="+", default=None, help="Config keys for deduplication"
     )
     plot_parser.add_argument(
@@ -168,6 +347,14 @@ Examples:
     plot_group = plot_parser.add_mutually_exclusive_group(required=True)
     plot_group.add_argument("--metric", help="Single metric to plot")
     plot_group.add_argument("--metrics", nargs="+", help="Multiple metrics (subplots)")
+    plot_parser.add_argument(
+        "--metric-map",
+        action="append",
+        dest="metric_maps",
+        metavar="LABEL=METRIC",
+        help="Map metric name for a project (e.g., --metric-map EXPO=eval_base/success). "
+        "For multi-metric: --metric-map EXPO:eval/success=eval_base/success",
+    )
     plot_parser.add_argument("--group-by", nargs="+", help="Config key(s) for grouping lines")
     plot_parser.add_argument("--split-by", help="Config key to split into multiple plots")
     plot_parser.add_argument("--x-axis", default="step", help="X-axis column (default: step)")
@@ -295,6 +482,12 @@ def cmd_configs(inspector: WandbInspector, args):
 
     runs = inspector.get_runs(refresh=args.refresh)
 
+    # Apply filters
+    filters = parse_filters(getattr(args, "filters", None))
+    if filters:
+        runs = apply_filters(runs, filters)
+        print(f"Filtered to {len(runs)} runs")
+
     if not runs:
         print("No runs found.")
         return
@@ -351,6 +544,12 @@ def cmd_inspect(inspector: WandbInspector, args):
 
     metric_name = args.metric
     runs = inspector.get_runs()
+
+    # Apply filters
+    filters = parse_filters(getattr(args, "filters", None))
+    if filters:
+        runs = apply_filters(runs, filters)
+        print(f"Filtered to {len(runs)} runs")
 
     if not runs:
         print("No runs found.")
@@ -428,12 +627,19 @@ def cmd_inspect(inspector: WandbInspector, args):
 
 def cmd_report(inspector: WandbInspector, args):
     """Generate report."""
+    # Parse filters
+    filters = parse_filters(getattr(args, "filters", None))
+
     report = inspector.aggregate(
         metric_keys=args.metrics,
         config_keys=args.config_keys,
         group_by=args.group_by,
+        config_filters=filters,
         refresh=args.refresh,
     )
+
+    if filters:
+        print(f"Filtered to {report.total_runs} runs")
 
     if args.format == "latex":
         output = inspector.to_latex_aggregated(
@@ -542,9 +748,13 @@ def format_text_table(report, metric_keys: list[str], show_std: bool = True) -> 
 
 def cmd_export(inspector: WandbInspector, args):
     """Export to CSV."""
+    # Parse filters
+    filters = parse_filters(getattr(args, "filters", None))
+
     df = inspector.to_dataframe(
         metric_keys=args.metrics,
         config_keys=args.config_keys,
+        config_filters=filters,
         deduplicate=not args.no_dedup,
         refresh=args.refresh,
     )
@@ -567,7 +777,12 @@ def cmd_history(inspector: WandbInspector, args):
     refresh = getattr(args, "refresh", False)
     output_file = args.output  # None if not specified
 
-    runs = inspector.get_runs()
+    # Parse filters
+    filters = parse_filters(getattr(args, "filters", None))
+
+    runs = inspector.get_runs(config_filters=filters)
+    if filters:
+        print(f"Filtered to {len(runs)} runs")
     if args.max_runs:
         runs = runs[: args.max_runs]
 
@@ -736,28 +951,81 @@ def cmd_plot(args, strategy_map):
     group_by = args.group_by or []
     split_by = args.split_by
 
-    # Check if history is cached for all projects
+    # Parse filters
+    filters = parse_filters(getattr(args, "filters", None))
+
+    # Parse metric mappings
+    metric_maps = parse_metric_maps(getattr(args, "metric_maps", None))
+
+    # Check if history is cached for all projects (using mapped metrics)
     for label, inspector in inspectors.items():
         for metric in metrics:
-            if not inspector.has_history(metric):
-                print(f"Error: No cached history for '{metric}' in project '{label}'")
+            actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+            if not inspector.has_history(actual_metric):
+                print(f"Error: No cached history for '{actual_metric}' in project '{label}'")
                 print(
-                    f"Run first: wbutils history {inspector.entity} {inspector.project} --metric {metric}"
+                    f"Run first: wbutils history {inspector.entity} {inspector.project} --metric {actual_metric}"
                 )
                 return
 
     # Collect all data with project labels
     # Structure: {project_label: {run_id: config}}
     all_run_configs = {}
-    all_history = []  # List of (project_label, history_row)
+    all_history = []  # List of (project_label, canonical_metric, history_row)
+    total_runs_before_filter = 0
+    total_runs_after_filter = 0
 
     for label, inspector in inspectors.items():
-        runs = inspector.get_runs()
+        # Get all runs first, then apply filters with debug output
+        all_runs = inspector.get_runs()
+        total_runs_before_filter += len(all_runs)
+
+        if filters:
+            runs = apply_filters(all_runs, filters)
+        else:
+            runs = all_runs
+        total_runs_after_filter += len(runs)
+
         all_run_configs[label] = {r.id: r.config for r in runs}
 
+        # Get run IDs for filtering history
+        valid_run_ids = set(r.id for r in runs)
+
         for metric in metrics:
-            for row in inspector.get_history(metric):
-                all_history.append((label, metric, row))
+            # Get actual metric name for this project
+            actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+
+            for row in inspector.get_history(actual_metric):
+                # Only include history for runs that pass the filter
+                if row["run_id"] in valid_run_ids:
+                    # Store with canonical metric name for consistent grouping
+                    all_history.append((label, metric, row))
+
+    if filters and not all_history:
+        if total_runs_after_filter == 0:
+            print("No data after applying filters.")
+        else:
+            print(
+                f"Warning: {total_runs_after_filter} runs matched filters, but no history data found."
+            )
+            print("This could mean:")
+            print("  - History wasn't cached for the filtered runs")
+            print("  - The cached history doesn't overlap with filtered run IDs")
+            print("\nTry checking cached history vs run IDs:")
+            for label, inspector in inspectors.items():
+                for metric in metrics:
+                    actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+                    history = inspector.get_history(actual_metric)
+                    history_run_ids = set(r["run_id"] for r in history)
+                    filtered_run_ids = set(all_run_configs[label].keys())
+                    overlap = history_run_ids & filtered_run_ids
+                    print(
+                        f"  {label}: {len(history_run_ids)} history runs, {len(filtered_run_ids)} filtered runs, {len(overlap)} overlap"
+                    )
+        return
+
+    if filters and total_runs_after_filter > 0:
+        print(f"Filtered to {total_runs_after_filter}/{total_runs_before_filter} runs")
 
     # Determine split values if split_by is set
     split_values = set()

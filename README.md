@@ -184,10 +184,28 @@ wbutils plot my-entity my-project --metric eval/success --split-by env_name -o c
 wbutils plot my-entity --metric eval/success \
   --project baseline:proj1 --project improved:proj2
 
+# Multi-project with different metric names
+wbutils plot my-entity --metric eval/success \
+  --project DSRL:DSRL --project EXPO:EXPO \
+  --metric-map EXPO=eval_base/success
+
 # Customize plot
 wbutils plot my-entity my-project --metric eval/success --group-by env_name \
   --title "Success Rate" --xlabel "Steps" --ylabel "Success" \
   --xlim 0 1000000 --ylim 0 1 --figsize 12 8
+
+# Filter runs by config values
+wbutils plot my-entity my-project --metric eval/success --filter env_name=square
+wbutils history my-entity my-project --metric eval/success --filter env_name=square
+wbutils report my-entity my-project --metrics eval/success --filter env_name=square
+
+# Multiple filters (AND logic)
+wbutils plot my-entity my-project --metric eval/success \
+  --filter env_name=square --filter seed=0
+
+# Filter with multiple values (OR within key)
+wbutils plot my-entity my-project --metric eval/success \
+  --filter env_name=square,tool_hang --filter seed=0,1,2
 
 # Generate text report (default format)
 wbutils report my-entity my-project --metrics eval/success
@@ -219,6 +237,34 @@ wbutils report my-entity my-project \
     --metrics eval/success \
     --dedup-keys env_name seed \
     --group-by env_name
+```
+
+## Filtering Pipeline
+
+Commands process runs through a clear pipeline:
+
+```
+All runs
+  → --filter (select runs matching config values)
+    → --dedup-keys (deduplicate by config keys)
+      → --group-by (aggregate for reports/plots)
+        → --split-by (split into multiple plots)
+```
+
+**Filter syntax:**
+```bash
+--filter key=value              # exact match
+--filter key=val1,val2          # OR: match any value
+--filter key1=a --filter key2=b # AND: both must match
+```
+
+**Example workflow:**
+```bash
+# Filter to specific envs, dedup by seed, group by env
+wbutils report my-entity my-project --metrics eval/success \
+  --filter env_name=square,tool_hang \
+  --dedup-keys env_name seed \
+  --group-by env_name
 ```
 
 ## Example LaTeX Output
@@ -352,6 +398,31 @@ wbutils plot my-entity --metric eval/success \
   --project improved:improved-proj \
   --split-by env_name \
   -o comparison.png
+```
+
+### Metric Name Mapping
+
+When comparing projects that use different metric names for the same thing, use `--metric-map`:
+
+```bash
+# EXPO uses eval_base/success instead of eval/success
+wbutils plot my-entity --metric eval/success \
+  --project DSRL:DSRL \
+  --project EXPO:EXPO \
+  --metric-map EXPO=eval_base/success
+
+# For multiple metrics, specify each mapping
+wbutils plot my-entity --metrics eval/success eval/return \
+  --project DSRL:DSRL \
+  --project EXPO:EXPO \
+  --metric-map EXPO:eval/success=eval_base/success \
+  --metric-map EXPO:eval/return=eval_base/return
+```
+
+Note: You need to cache history for the actual metric names:
+```bash
+wbutils history my-entity DSRL --metric eval/success
+wbutils history my-entity EXPO --metric eval_base/success  # actual name in EXPO
 ```
 
 ### Manual Plotting with CSV Export

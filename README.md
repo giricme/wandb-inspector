@@ -166,6 +166,10 @@ wbutils inspect my-entity my-project --metric eval/success --show-runs --max-run
 wbutils history my-entity my-project --metric eval/success
 wbutils history my-entity my-project --metric eval/success --refresh  # force re-fetch
 
+# Specify x-axis (step key) - default is _step
+wbutils history my-entity my-project --metric eval/success --step-key _step   # training steps (default)
+wbutils history my-entity my-project --metric eval/success --step-key epoch   # use epoch as x-axis
+
 # Export cached history to CSV
 wbutils history my-entity my-project --metric eval/success -o eval_success.csv
 wbutils history my-entity my-project --metric eval/success --config-keys env_name seed -o history.csv
@@ -188,6 +192,11 @@ wbutils plot my-entity --metric eval/success \
 wbutils plot my-entity --metric eval/success \
   --project DSRL:DSRL --project EXPO:EXPO \
   --metric-map EXPO=eval_base/success
+
+# Cross-entity comparison
+wbutils plot --metric eval/success \
+  --project A:team-a/projectX \
+  --project B:team-b/projectY
 
 # Customize plot
 wbutils plot my-entity my-project --metric eval/success --group-by env_name \
@@ -223,11 +232,22 @@ wbutils report my-entity my-project \
     --format latex \
     --output results.tex
 
+# Cross-entity report (compare across teams)
+wbutils report --metrics eval/success \
+  --project ours:team-a/project1 \
+  --project theirs:team-b/project2
+
 # Export to CSV
 wbutils export my-entity my-project \
     --metrics eval/success \
     --config-keys env_name seed lr \
     --output results.csv
+
+# Cross-entity export
+wbutils export --metrics eval/success \
+  --project A:team-a/project1 \
+  --project B:team-b/project2 \
+  -o combined.csv
 
 # Show project statistics
 wbutils stats my-entity my-project
@@ -358,7 +378,15 @@ wbutils plot my-entity my-project --metric eval/success --group-by env_name \
   --ylim 0 1 \
   --figsize 12 8 \
   -o success.png
+
+# Smooth noisy curves (EMA smoothing, 0=none, 0.9=heavy)
+wbutils plot my-entity my-project --metric eval/success --smooth 0.6
+
+# Disable automatic step alignment to zero
+wbutils plot my-entity my-project --metric eval/success --no-align-zero
 ```
+
+By default, steps are normalized to start at zero for each run. Use `--no-align-zero` to preserve original step values.
 
 ### Split into Multiple Plots
 
@@ -377,11 +405,11 @@ wbutils plot my-entity my-project --metric eval/success --split-by env_name --gr
 Compare results across different projects in the same plot:
 
 ```bash
-# Cache history for each project first
-wbutils history my-entity baseline-proj --metric eval/success
-wbutils history my-entity improved-proj --metric eval/success
+# Cache history for each project first (use same --step-key for comparable x-axes)
+wbutils history my-entity baseline-proj --metric eval/success --step-key _step
+wbutils history my-entity improved-proj --metric eval/success --step-key _step
 
-# Compare with labeled projects
+# Compare with labeled projects (same entity)
 wbutils plot my-entity --metric eval/success \
   --project baseline:baseline-proj \
   --project improved:improved-proj
@@ -399,6 +427,48 @@ wbutils plot my-entity --metric eval/success \
   --split-by env_name \
   -o comparison.png
 ```
+
+**Important:** When comparing multiple projects, all must be cached with the same `--step-key`. The plot command will error if projects have mismatched step_keys.
+
+### Cross-Entity Comparison
+
+Compare projects from different wandb entities:
+
+```bash
+# Cache history from different entities (separate commands)
+wbutils history team-A projectX --metric eval/success
+wbutils history team-B projectY --metric eval/success
+
+# Plot combining both - use entity/project format
+wbutils plot --metric eval/success \
+  --project labelA:team-A/projectX \
+  --project labelB:team-B/projectY
+
+# Report combining both
+wbutils report --metrics eval/success \
+  --project labelA:team-A/projectX \
+  --project labelB:team-B/projectY \
+  --group-by _project
+
+# Export combining both to CSV
+wbutils export --metrics eval/success \
+  --project labelA:team-A/projectX \
+  --project labelB:team-B/projectY \
+  -o combined.csv
+
+# Mixed: some with default entity, some explicit
+wbutils plot my-team --metric eval/success \
+  --project baseline:my-project \
+  --project external:other-team/their-project
+```
+
+Project specification formats:
+- `label:project` - uses positional entity as default
+- `label:entity/project` - explicit entity
+- `project` - label defaults to project name, uses positional entity
+- `entity/project` - label defaults to project name
+
+**Note:** When combining multiple projects, report automatically groups by `_project` and export adds `_project` and `_entity` columns.
 
 ### Metric Name Mapping
 

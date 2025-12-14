@@ -754,7 +754,15 @@ class WandbInspector:
             if path and path.exists():
                 try:
                     with open(path) as f:
-                        history = json.load(f)
+                        cached = json.load(f)
+                    # Handle both old format (list) and new format (dict with metadata)
+                    if isinstance(cached, list):
+                        history = cached
+                    elif isinstance(cached, dict) and "data" in cached:
+                        history = cached["data"]
+                    else:
+                        continue
+
                     for row in history:
                         results.append(
                             {
@@ -768,6 +776,27 @@ class WandbInspector:
                     pass
 
         return results
+
+    def get_history_step_key(self, metric: str) -> str | None:
+        """
+        Get the step_key used when caching history for a metric.
+
+        Returns the step_key from the first cached run found, or None if unknown.
+        """
+        import json
+
+        runs = self.get_runs()
+        for run in runs:
+            path = self._history_cache_path(run.id, metric)
+            if path and path.exists():
+                try:
+                    with open(path) as f:
+                        cached = json.load(f)
+                    if isinstance(cached, dict) and "step_key" in cached:
+                        return cached["step_key"]
+                except Exception:
+                    pass
+        return None
 
     def has_history(self, metric: str) -> bool:
         """Check if history is cached for a metric."""

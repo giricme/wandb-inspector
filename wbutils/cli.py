@@ -174,6 +174,62 @@ def get_mapped_metric(
     return canonical_metric
 
 
+def parse_project_specs(
+    project_args: list[str] | None, default_entity: str | None
+) -> list[tuple[str, str, str]]:
+    """
+    Parse project specification arguments.
+
+    Formats:
+        label:project           -> (label, default_entity, project)
+        label:entity/project    -> (label, entity, project)
+        project                 -> (project, default_entity, project)
+        entity/project          -> (project, entity, project)
+
+    Args:
+        project_args: List of project spec strings
+        default_entity: Default entity to use when not specified in spec
+
+    Returns:
+        List of (label, entity, project) tuples
+    """
+    if not project_args:
+        return []
+
+    results = []
+
+    for p in project_args:
+        if ":" in p:
+            # Has explicit label
+            label, path = p.split(":", 1)
+            if "/" in path:
+                # label:entity/project
+                entity, project = path.split("/", 1)
+            else:
+                # label:project (use default entity)
+                if not default_entity:
+                    print(f"Error: No default entity for '{p}'. Use 'label:entity/project' format.")
+                    return []
+                entity, project = default_entity, path
+        else:
+            # No label
+            if "/" in p:
+                # entity/project (label = project name)
+                entity, project = p.split("/", 1)
+                label = project
+            else:
+                # Just project name (use default entity, label = project)
+                if not default_entity:
+                    print(f"Error: No default entity for '{p}'. Use 'entity/project' format.")
+                    return []
+                entity, project = default_entity, p
+                label = project
+
+        results.append((label, entity, project))
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Inspect wandb projects: discover metrics, deduplicate runs, generate reports.",
@@ -203,6 +259,51 @@ Examples:
             p.add_argument("projects", nargs="+", help="Wandb project name(s)")
         else:
             p.add_argument("project", help="Wandb project name")
+        p.add_argument("--cache-dir", help="Directory to cache data (default: .cache/wbutils)")
+        p.add_argument("--no-cache", action="store_true", help="Disable caching")
+        p.add_argument(
+            "--filter",
+            action="append",
+            dest="filters",
+            metavar="KEY=VALUE",
+            help="Filter runs by config (e.g., --filter env_name=square). Use comma for OR: key=a,b. Repeat for AND.",
+        )
+        p.add_argument(
+            "--dedup-keys",
+            nargs="+",
+            default=None,
+            help="Config keys for deduplication (e.g., --dedup-keys task_name seed)",
+        )
+        p.add_argument(
+            "--dedup-strategy",
+            choices=["latest", "longest", "best"],
+            default="latest",
+            help="Strategy for selecting among duplicates",
+        )
+
+    # Arguments for analysis commands (support cross-entity)
+    def add_analysis_args(p):
+        """Add arguments for analysis commands that support cross-entity comparison."""
+        p.add_argument(
+            "entity",
+            nargs="?",
+            default=None,
+            help="Default entity (optional if using entity/project in --project)",
+        )
+        p.add_argument(
+            "project",
+            nargs="?",
+            default=None,
+            help="Wandb project name (optional if using --project)",
+        )
+        p.add_argument(
+            "--project",
+            dest="projects",
+            action="append",
+            metavar="LABEL:PROJECT",
+            help="Project with label. Formats: 'label:project' (uses default entity), "
+            "'label:entity/project' (explicit entity). Can be repeated.",
+        )
         p.add_argument("--cache-dir", help="Directory to cache data (default: .cache/wbutils)")
         p.add_argument("--no-cache", action="store_true", help="Disable caching")
         p.add_argument(
@@ -268,7 +369,7 @@ Examples:
 
     # Report command
     report_parser = subparsers.add_parser("report", help="Generate report")
-    add_common_args(report_parser)
+    add_analysis_args(report_parser)
     report_parser.add_argument("--metrics", nargs="+", required=True, help="Metrics to include")
     report_parser.add_argument("--config-keys", nargs="+", help="Config keys to include in output")
     report_parser.add_argument(
@@ -285,7 +386,7 @@ Examples:
 
     # Export command
     export_parser = subparsers.add_parser("export", help="Export runs to CSV")
-    add_common_args(export_parser)
+    add_analysis_args(export_parser)
     export_parser.add_argument("--metrics", nargs="+", help="Metrics to include")
     export_parser.add_argument("--config-keys", nargs="+", help="Config keys to include")
     export_parser.add_argument("--output", "-o", required=True, help="Output file")
@@ -312,8 +413,13 @@ Examples:
 
     # Plot command - plot cached history data
     plot_parser = subparsers.add_parser("plot", help="Plot cached metric history")
-    # Custom args for plot (don't use add_common_args due to special project handling)
-    plot_parser.add_argument("entity", help="Wandb entity (username or team)")
+    # Custom args for plot - entity is optional when using full paths in --project
+    plot_parser.add_argument(
+        "entity",
+        nargs="?",
+        default=None,
+        help="Default entity (optional if using entity/project in --project)",
+    )
     plot_parser.add_argument(
         "project", nargs="?", default=None, help="Wandb project name (optional if using --project)"
     )
@@ -322,7 +428,8 @@ Examples:
         dest="projects",
         action="append",
         metavar="LABEL:PROJECT",
-        help="Project with label (e.g., --project baseline:proj1). Can be repeated.",
+        help="Project with label. Formats: 'label:project' (uses default entity), "
+        "'label:entity/project' (explicit entity). Can be repeated.",
     )
     plot_parser.add_argument(
         "--cache-dir", help="Directory to cache data (default: .cache/wbutils)"
@@ -357,9 +464,8 @@ Examples:
     )
     plot_parser.add_argument("--group-by", nargs="+", help="Config key(s) for grouping lines")
     plot_parser.add_argument("--split-by", help="Config key to split into multiple plots")
-    plot_parser.add_argument("--x-axis", default="step", help="X-axis column (default: step)")
     plot_parser.add_argument("--title", help="Plot title (auto-generated if not provided)")
-    plot_parser.add_argument("--xlabel", help="X-axis label (default: from x-axis)")
+    plot_parser.add_argument("--xlabel", help="X-axis label (default: Step)")
     plot_parser.add_argument("--ylabel", help="Y-axis label (default: from metric name)")
     plot_parser.add_argument("--xlim", nargs=2, type=float, help="X-axis limits (min max)")
     plot_parser.add_argument("--ylim", nargs=2, type=float, help="Y-axis limits (min max)")
@@ -368,6 +474,18 @@ Examples:
     )
     plot_parser.add_argument(
         "--no-std-bands", action="store_true", help="Disable std deviation bands"
+    )
+    plot_parser.add_argument(
+        "--smooth",
+        type=float,
+        default=0,
+        metavar="ALPHA",
+        help="Smoothing factor (0-1). 0=none, 0.9=heavy smoothing (EMA)",
+    )
+    plot_parser.add_argument(
+        "--no-align-zero",
+        action="store_true",
+        help="Don't align steps to start at zero (default: align to zero)",
     )
     plot_parser.add_argument("--output", "-o", help="Save to file (default: display)")
     plot_parser.add_argument(
@@ -400,8 +518,14 @@ Examples:
     elif args.command == "plot":
         # Plot has special project handling (optional positional + --project flags)
         cmd_plot(args, strategy_map)
+    elif args.command == "report":
+        # Report supports cross-entity
+        cmd_report(args, strategy_map)
+    elif args.command == "export":
+        # Export supports cross-entity
+        cmd_export(args, strategy_map)
     else:
-        # All other commands use single project
+        # Data ingestion commands use single entity/project
         inspector = WandbInspector(
             entity=args.entity,
             project=args.project,
@@ -417,10 +541,6 @@ Examples:
             cmd_configs(inspector, args)
         elif args.command == "inspect":
             cmd_inspect(inspector, args)
-        elif args.command == "report":
-            cmd_report(inspector, args)
-        elif args.command == "export":
-            cmd_export(inspector, args)
         elif args.command == "history":
             cmd_history(inspector, args)
         elif args.command == "stats":
@@ -625,33 +745,236 @@ def cmd_inspect(inspector: WandbInspector, args):
         print(f"  Metric not found in history (or not logged as time series)")
 
 
-def cmd_report(inspector: WandbInspector, args):
-    """Generate report."""
+def cmd_report(args, strategy_map):
+    """Generate report with cross-entity support."""
+    from collections import defaultdict
+
+    import numpy as np
+
+    # Parse projects
+    project_configs = []  # List of (label, entity, project)
+
+    if args.projects:
+        project_configs = parse_project_specs(args.projects, args.entity)
+        if not project_configs:
+            return  # Error already printed
+    elif args.project and args.entity:
+        project_configs.append((args.project, args.entity, args.project))
+    elif args.entity and not args.project:
+        print("Error: Must specify project (positional) or --project flag(s)")
+        return
+    else:
+        print("Error: Must specify project. Use --project flag(s) with entity/project format")
+        return
+
     # Parse filters
     filters = parse_filters(getattr(args, "filters", None))
 
-    report = inspector.aggregate(
-        metric_keys=args.metrics,
-        config_keys=args.config_keys,
-        group_by=args.group_by,
-        config_filters=filters,
-        refresh=args.refresh,
-    )
+    # Create inspectors and collect data
+    multi_project = len(project_configs) > 1
+    group_by = args.group_by or []
+
+    # If multi-project and not explicitly grouping by project, add it
+    if multi_project and "_project" not in group_by:
+        effective_group_by = ["_project"] + group_by
+    else:
+        effective_group_by = group_by
+
+    # Collect all runs with their data
+    all_data = []  # List of (project_label, run_summary, run_config)
+
+    for label, entity, proj in project_configs:
+        inspector = WandbInspector(
+            entity=entity,
+            project=proj,
+            dedup_keys=args.dedup_keys,
+            dedup_strategy=strategy_map[args.dedup_strategy],
+            cache_dir=args.cache_dir,
+            no_cache=args.no_cache,
+        )
+
+        runs = inspector.get_runs(config_filters=filters, refresh=args.refresh)
+
+        for run in runs:
+            summary = run.summary if isinstance(run.summary, dict) else {}
+            config = run.config if isinstance(run.config, dict) else {}
+            all_data.append((label, summary, config))
+
+    if not all_data:
+        print("No runs found.")
+        return
 
     if filters:
-        print(f"Filtered to {report.total_runs} runs")
+        print(f"Filtered to {len(all_data)} runs")
+
+    # Group and aggregate
+    # grouped: group_key -> metric -> [values]
+    grouped = defaultdict(lambda: defaultdict(list))
+
+    for label, summary, config in all_data:
+        # Build group key
+        key_parts = []
+        for gk in effective_group_by:
+            if gk == "_project":
+                key_parts.append(label)
+            else:
+                key_parts.append(config.get(gk, "unknown"))
+
+        if len(key_parts) == 0:
+            group_key = "all"
+        elif len(key_parts) == 1:
+            group_key = key_parts[0]
+        else:
+            group_key = tuple(key_parts)
+
+        # Collect metric values
+        for m in args.metrics:
+            val = summary.get(m)
+            if val is not None and isinstance(val, (int, float)):
+                grouped[group_key][m].append(val)
+
+    # Compute stats
+    class Stats:
+        def __init__(self, values):
+            self.values = values
+            self.count = len(values)
+            self.mean = np.mean(values) if values else None
+            self.std = np.std(values) if len(values) > 1 else None
+
+    group_stats = {}  # group_key -> metric -> Stats
+    for group_key, metrics in grouped.items():
+        group_stats[group_key] = {}
+        for m, vals in metrics.items():
+            group_stats[group_key][m] = Stats(vals)
+
+    # Overall stats
+    overall_stats = {}
+    for m in args.metrics:
+        all_vals = []
+        for _, metrics in grouped.items():
+            all_vals.extend(metrics.get(m, []))
+        overall_stats[m] = Stats(all_vals)
+
+    # Format output
+    def fmt_val(stats, show_std: bool) -> str:
+        if stats is None or stats.mean is None:
+            return "-"
+        if show_std and stats.std is not None:
+            return f"{stats.mean:.4f} ± {stats.std:.4f}"
+        return f"{stats.mean:.4f}"
+
+    show_std = not args.no_std
 
     if args.format == "latex":
-        output = inspector.to_latex_aggregated(
-            report,
-            metric_keys=args.metrics,
-            show_std=not args.no_std,
-            caption=args.caption,
-            label=args.label,
-        )
+        # Generate LaTeX table
+        lines = []
+        lines.append("\\begin{table}[htbp]")
+        lines.append("\\centering")
+
+        # Column spec
+        n_group_cols = len(effective_group_by) if effective_group_by else 0
+        n_metric_cols = len(args.metrics)
+        col_spec = "l" * n_group_cols + "r" * n_metric_cols
+        lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
+        lines.append("\\toprule")
+
+        # Header
+        header_parts = [gk.replace("_", "\\_") for gk in effective_group_by]
+        header_parts.extend([m.replace("_", "\\_") for m in args.metrics])
+        lines.append(" & ".join(header_parts) + " \\\\")
+        lines.append("\\midrule")
+
+        # Data rows
+        for group_key in sorted(group_stats.keys(), key=str):
+            row_parts = []
+            if isinstance(group_key, tuple):
+                row_parts.extend([str(v).replace("_", "\\_") for v in group_key])
+            elif group_key != "all":
+                row_parts.append(str(group_key).replace("_", "\\_"))
+
+            for m in args.metrics:
+                stats = group_stats[group_key].get(m)
+                row_parts.append(fmt_val(stats, show_std))
+
+            lines.append(" & ".join(row_parts) + " \\\\")
+
+        lines.append("\\bottomrule")
+        lines.append("\\end{tabular}")
+        lines.append(f"\\caption{{{args.caption}}}")
+        lines.append(f"\\label{{{args.label}}}")
+        lines.append("\\end{table}")
+
+        output = "\n".join(lines)
     else:
         # Text table format
-        output = format_text_table(report, args.metrics, show_std=not args.no_std)
+        lines = []
+        lines.append(f"Results ({len(all_data)} runs)")
+        lines.append("")
+
+        if group_stats and effective_group_by:
+            groups = sorted(group_stats.keys(), key=str)
+
+            # Calculate column widths
+            col_widths = []
+            for i, gk in enumerate(effective_group_by):
+                max_width = len(gk)
+                for g in groups:
+                    val = g[i] if isinstance(g, tuple) else g
+                    max_width = max(max_width, len(str(val)))
+                col_widths.append(max_width)
+
+            metric_widths = []
+            for m in args.metrics:
+                max_width = len(m)
+                for g in groups:
+                    stats = group_stats[g].get(m)
+                    val_str = fmt_val(stats, show_std)
+                    max_width = max(max_width, len(val_str))
+                metric_widths.append(max_width)
+
+            # Header row
+            header_parts = []
+            for i, gk in enumerate(effective_group_by):
+                header_parts.append(gk.ljust(col_widths[i]))
+            for i, m in enumerate(args.metrics):
+                header_parts.append(m.rjust(metric_widths[i]))
+
+            header = "  ".join(header_parts)
+            lines.append(header)
+            lines.append("-" * len(header))
+
+            # Data rows
+            for g in groups:
+                row_parts = []
+                if isinstance(g, tuple):
+                    for i, val in enumerate(g):
+                        row_parts.append(str(val).ljust(col_widths[i]))
+                else:
+                    row_parts.append(str(g).ljust(col_widths[0]))
+
+                for i, m in enumerate(args.metrics):
+                    stats = group_stats[g].get(m)
+                    val_str = fmt_val(stats, show_std)
+                    row_parts.append(val_str.rjust(metric_widths[i]))
+
+                lines.append("  ".join(row_parts))
+
+            # Summary stats
+            lines.append("")
+            lines.append("Overall:")
+            for m in args.metrics:
+                stats = overall_stats.get(m)
+                lines.append(f"  {m}: {fmt_val(stats, show_std)} (n={stats.count if stats else 0})")
+        else:
+            # No grouping - just show overall stats
+            for m in args.metrics:
+                stats = overall_stats.get(m)
+                if stats:
+                    lines.append(f"{m}: {fmt_val(stats, show_std)} (n={stats.count})")
+                else:
+                    lines.append(f"{m}: -")
+
+        output = "\n".join(lines)
 
     if args.output:
         with open(args.output, "w") as f:
@@ -661,104 +984,86 @@ def cmd_report(inspector: WandbInspector, args):
         print(output)
 
 
-def format_text_table(report, metric_keys: list[str], show_std: bool = True) -> str:
-    """Format report as a nice text table."""
+def cmd_export(args, strategy_map):
+    """Export to CSV with cross-entity support."""
+    import pandas as pd
 
-    def fmt_val(stats, show_std: bool) -> str:
-        if stats is None or stats.mean is None:
-            return "-"
-        if show_std and stats.std is not None:
-            return f"{stats.mean:.4f} ± {stats.std:.4f}"
-        return f"{stats.mean:.4f}"
+    # Parse projects
+    project_configs = []  # List of (label, entity, project)
 
-    lines = []
-
-    # Header
-    lines.append(f"Results ({report.total_runs} runs)")
-    lines.append("")
-
-    if report.groups and report.group_by_keys:
-        # Grouped output - create table
-        group_keys = report.group_by_keys
-        groups = sorted(report.groups.keys())
-
-        # Calculate column widths
-        col_widths = []
-        for i, gk in enumerate(group_keys):
-            max_width = len(gk)
-            for g in groups:
-                val = g[i] if isinstance(g, tuple) else g
-                max_width = max(max_width, len(str(val)))
-            col_widths.append(max_width)
-
-        metric_widths = []
-        for m in metric_keys:
-            max_width = len(m)
-            for g in groups:
-                stats = report.groups[g].get(m)
-                val_str = fmt_val(stats, show_std)
-                max_width = max(max_width, len(val_str))
-            metric_widths.append(max_width)
-
-        # Header row
-        header_parts = []
-        for i, gk in enumerate(group_keys):
-            header_parts.append(gk.ljust(col_widths[i]))
-        for i, m in enumerate(metric_keys):
-            header_parts.append(m.rjust(metric_widths[i]))
-
-        header = "  ".join(header_parts)
-        lines.append(header)
-        lines.append("-" * len(header))
-
-        # Data rows
-        for g in groups:
-            row_parts = []
-            if isinstance(g, tuple):
-                for i, val in enumerate(g):
-                    row_parts.append(str(val).ljust(col_widths[i]))
-            else:
-                row_parts.append(str(g).ljust(col_widths[0]))
-
-            for i, m in enumerate(metric_keys):
-                stats = report.groups[g].get(m)
-                val_str = fmt_val(stats, show_std)
-                row_parts.append(val_str.rjust(metric_widths[i]))
-
-            lines.append("  ".join(row_parts))
-
-        # Summary stats
-        lines.append("")
-        lines.append("Overall:")
-        for m in metric_keys:
-            stats = report.metric_stats.get(m)
-            lines.append(f"  {m}: {fmt_val(stats, show_std)} (n={stats.count if stats else 0})")
-
+    if args.projects:
+        project_configs = parse_project_specs(args.projects, args.entity)
+        if not project_configs:
+            return  # Error already printed
+    elif args.project and args.entity:
+        project_configs.append((args.project, args.entity, args.project))
+    elif args.entity and not args.project:
+        print("Error: Must specify project (positional) or --project flag(s)")
+        return
     else:
-        # No grouping - just show overall stats
-        for m in metric_keys:
-            stats = report.metric_stats.get(m)
-            if stats:
-                lines.append(f"{m}: {fmt_val(stats, show_std)} (n={stats.count})")
-            else:
-                lines.append(f"{m}: -")
+        print("Error: Must specify project. Use --project flag(s) with entity/project format")
+        return
 
-    return "\n".join(lines)
-
-
-def cmd_export(inspector: WandbInspector, args):
-    """Export to CSV."""
     # Parse filters
     filters = parse_filters(getattr(args, "filters", None))
 
-    df = inspector.to_dataframe(
-        metric_keys=args.metrics,
-        config_keys=args.config_keys,
-        config_filters=filters,
-        deduplicate=not args.no_dedup,
-        refresh=args.refresh,
-    )
+    multi_project = len(project_configs) > 1
 
+    # Collect all runs
+    all_rows = []
+
+    for label, entity, proj in project_configs:
+        inspector = WandbInspector(
+            entity=entity,
+            project=proj,
+            dedup_keys=args.dedup_keys,
+            dedup_strategy=strategy_map[args.dedup_strategy],
+            cache_dir=args.cache_dir,
+            no_cache=args.no_cache,
+        )
+
+        # Get runs
+        if args.no_dedup:
+            runs = inspector.get_runs(config_filters=filters, refresh=args.refresh)
+        else:
+            runs = inspector.get_runs(config_filters=filters, refresh=args.refresh)
+
+        for run in runs:
+            summary = run.summary if isinstance(run.summary, dict) else {}
+            config = run.config if isinstance(run.config, dict) else {}
+
+            row = {
+                "run_id": run.id,
+                "run_name": run.name,
+            }
+
+            # Add project column if multi-project
+            if multi_project:
+                row["_project"] = label
+                row["_entity"] = entity
+
+            # Add config keys
+            if args.config_keys:
+                for k in args.config_keys:
+                    row[k] = config.get(k)
+
+            # Add metrics
+            if args.metrics:
+                for m in args.metrics:
+                    row[m] = summary.get(m)
+            else:
+                # Export all summary metrics
+                for k, v in summary.items():
+                    if isinstance(v, (int, float, str, bool)) or v is None:
+                        row[k] = v
+
+            all_rows.append(row)
+
+    if not all_rows:
+        print("No runs found.")
+        return
+
+    df = pd.DataFrame(all_rows)
     df.to_csv(args.output, index=False)
     print(f"Exported {len(df)} runs to {args.output}")
 
@@ -802,37 +1107,57 @@ def cmd_history(inspector: WandbInspector, args):
         safe_metric = metric.replace("/", "_").replace("\\", "_")
         return cache_dir / f"{run_id}_{safe_metric}.json"
 
-    def load_from_cache(run_id: str, metric: str) -> list | None:
+    def load_from_cache(run_id: str, metric: str) -> tuple[list, str | None] | None:
+        """Load history from cache. Returns (data, step_key) or None."""
         path = get_cache_path(run_id, metric)
         if path and path.exists() and not refresh:
             try:
                 with open(path) as f:
-                    return json.load(f)
+                    cached = json.load(f)
+                # Handle both old format (list) and new format (dict with metadata)
+                if isinstance(cached, list):
+                    return cached, None  # Old format, unknown step_key
+                elif isinstance(cached, dict) and "data" in cached:
+                    return cached["data"], cached.get("step_key")
             except Exception:
                 pass
         return None
 
-    def save_to_cache(run_id: str, metric: str, data: list):
+    def save_to_cache(run_id: str, metric: str, data: list, step_key: str):
+        """Save history to cache with step_key metadata."""
         path = get_cache_path(run_id, metric)
         if path:
             try:
                 with open(path, "w") as f:
-                    json.dump(data, f)
+                    json.dump({"step_key": step_key, "data": data}, f)
             except Exception:
                 pass
 
-    print(f"Fetching history for '{metric_name}' from {len(runs)} runs...")
+    print(f"Fetching history for '{metric_name}' from {len(runs)} runs (step_key={step_key})...")
 
     api = wandb.Api()
     cache_hits = 0
     total_points = 0
     run_stats = []  # For summary
+    step_key_mismatch = False
 
     for i, cached_run in enumerate(runs):
         # Try cache first
-        cached_history = load_from_cache(cached_run.id, metric_name)
+        cache_result = load_from_cache(cached_run.id, metric_name)
 
-        if cached_history is not None:
+        if cache_result is not None:
+            cached_history, cached_step_key = cache_result
+
+            # Warn if cached with different step_key
+            if cached_step_key and cached_step_key != step_key:
+                if not step_key_mismatch:
+                    print(
+                        f"\n  Warning: Cache was created with step_key='{cached_step_key}', "
+                        f"but you requested '{step_key}'."
+                    )
+                    print(f"  Use --refresh to re-fetch with new step_key.\n")
+                    step_key_mismatch = True
+
             count = len(cached_history)
             cache_hits += 1
             total_points += count
@@ -855,9 +1180,9 @@ def cmd_history(inspector: WandbInspector, args):
                 total_points += count
                 run_stats.append({"run": cached_run, "count": count, "cached": False})
 
-                # Save to cache
+                # Save to cache with step_key metadata
                 if history_data:
-                    save_to_cache(cached_run.id, metric_name, history_data)
+                    save_to_cache(cached_run.id, metric_name, history_data, step_key)
 
                 print(f"  [{i+1}/{len(runs)}] {cached_run.name}: {count} points")
 
@@ -881,7 +1206,8 @@ def cmd_history(inspector: WandbInspector, args):
             config = cached_run.config if isinstance(cached_run.config, dict) else {}
             config_vals = {k: config.get(k, "") for k in config_keys}
 
-            history_data = load_from_cache(cached_run.id, metric_name) or []
+            cache_result = load_from_cache(cached_run.id, metric_name)
+            history_data = cache_result[0] if cache_result else []
             for row in history_data:
                 rows.append(
                     {
@@ -915,30 +1241,34 @@ def cmd_plot(args, strategy_map):
     import matplotlib.pyplot as plt
     import numpy as np
 
-    # Parse projects - either positional or --project flags
-    # Format: --project label:project_name or --project project_name (label = project_name)
-    project_configs = []  # List of (label, project_name)
+    # Parse projects - supports cross-entity
+    # Formats:
+    #   --project label:project (uses default entity)
+    #   --project label:entity/project (explicit entity)
+    project_configs = []  # List of (label, entity, project)
 
     if args.projects:
         # Using --project flags
-        for p in args.projects:
-            if ":" in p:
-                label, proj = p.split(":", 1)
-            else:
-                label, proj = p, p
-            project_configs.append((label, proj))
-    elif args.project:
-        # Using positional project
-        project_configs.append((args.project, args.project))
-    else:
+        project_configs = parse_project_specs(args.projects, args.entity)
+        if not project_configs:
+            return  # Error already printed
+    elif args.project and args.entity:
+        # Using positional entity + project
+        project_configs.append((args.project, args.entity, args.project))
+    elif args.entity and not args.project:
+        # Just entity provided - error
         print("Error: Must specify project (positional) or --project flag(s)")
+        return
+    else:
+        print("Error: Must specify project. Use --project flag(s) with entity/project format")
+        print("Example: wbutils plot --project label:entity/project --metric eval/success")
         return
 
     # Create inspectors for each project
     inspectors = {}  # label -> inspector
-    for label, proj in project_configs:
+    for label, entity, proj in project_configs:
         inspectors[label] = WandbInspector(
-            entity=args.entity,
+            entity=entity,
             project=proj,
             dedup_keys=args.dedup_keys,
             dedup_strategy=strategy_map[args.dedup_strategy],
@@ -968,12 +1298,48 @@ def cmd_plot(args, strategy_map):
                 )
                 return
 
+    # Validate step_keys are consistent across projects
+    step_keys_by_project = {}  # label -> {metric: step_key}
+    for label, inspector in inspectors.items():
+        step_keys_by_project[label] = {}
+        for metric in metrics:
+            actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+            step_key = inspector.get_history_step_key(actual_metric)
+            step_keys_by_project[label][metric] = step_key
+
+    # Check for mismatches
+    if len(inspectors) > 1:
+        for metric in metrics:
+            step_keys = {}
+            for label in inspectors:
+                sk = step_keys_by_project[label].get(metric)
+                if sk:
+                    step_keys[label] = sk
+
+            unique_step_keys = set(step_keys.values())
+            if len(unique_step_keys) > 1:
+                print(f"Error: Projects have different step_keys for '{metric}':")
+                for label, sk in step_keys.items():
+                    actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+                    print(f"  {label} ({actual_metric}): step_key='{sk}'")
+                print("\nAll projects must use the same step_key for comparable plots.")
+                print("Re-cache with consistent --step-key:")
+                for label, inspector in inspectors.items():
+                    actual_metric = get_mapped_metric(label, metric, metric_maps, metrics)
+                    print(
+                        f"  wbutils history {inspector.entity} {inspector.project} --metric {actual_metric} --step-key _step --refresh"
+                    )
+                return
+
     # Collect all data with project labels
     # Structure: {project_label: {run_id: config}}
     all_run_configs = {}
     all_history = []  # List of (project_label, canonical_metric, history_row)
     total_runs_before_filter = 0
     total_runs_after_filter = 0
+
+    # Track min step per run for normalization
+    run_min_steps = {}  # (project_label, run_id) -> min_step
 
     for label, inspector in inspectors.items():
         # Get all runs first, then apply filters with debug output
@@ -998,8 +1364,26 @@ def cmd_plot(args, strategy_map):
             for row in inspector.get_history(actual_metric):
                 # Only include history for runs that pass the filter
                 if row["run_id"] in valid_run_ids:
+                    # Track min step per run
+                    run_key = (label, row["run_id"])
+                    if run_key not in run_min_steps:
+                        run_min_steps[run_key] = row["step"]
+                    else:
+                        run_min_steps[run_key] = min(run_min_steps[run_key], row["step"])
+
                     # Store with canonical metric name for consistent grouping
                     all_history.append((label, metric, row))
+
+    # Normalize steps to start at zero (unless disabled)
+    align_zero = not getattr(args, "no_align_zero", False)
+    if align_zero and run_min_steps:
+        normalized_history = []
+        for label, metric, row in all_history:
+            run_key = (label, row["run_id"])
+            min_step = run_min_steps.get(run_key, 0)
+            normalized_row = {**row, "step": row["step"] - min_step}
+            normalized_history.append((label, metric, normalized_row))
+        all_history = normalized_history
 
     if filters and not all_history:
         if total_runs_after_filter == 0:
@@ -1136,6 +1520,27 @@ def cmd_plot(args, strategy_map):
                 means = np.array(means)
                 stds = np.array(stds)
 
+                # Apply smoothing (EMA) if requested
+                smooth_alpha = getattr(args, "smooth", 0)
+                if smooth_alpha > 0 and len(means) > 1:
+                    smoothed_means = np.zeros_like(means)
+                    smoothed_means[0] = means[0]
+                    for i in range(1, len(means)):
+                        smoothed_means[i] = (
+                            smooth_alpha * smoothed_means[i - 1] + (1 - smooth_alpha) * means[i]
+                        )
+                    means = smoothed_means
+
+                    # Also smooth stds for consistent bands
+                    if np.any(stds > 0):
+                        smoothed_stds = np.zeros_like(stds)
+                        smoothed_stds[0] = stds[0]
+                        for i in range(1, len(stds)):
+                            smoothed_stds[i] = (
+                                smooth_alpha * smoothed_stds[i - 1] + (1 - smooth_alpha) * stds[i]
+                            )
+                        stds = smoothed_stds
+
                 # Format label
                 if group_key == "all":
                     label = metric if len(metrics) == 1 and not multi_project else None
@@ -1162,7 +1567,7 @@ def cmd_plot(args, strategy_map):
                     )
 
             # Labels and formatting
-            ax.set_xlabel(args.xlabel or args.x_axis.replace("_", " ").title())
+            ax.set_xlabel(args.xlabel or "Step")
             ax.set_ylabel(args.ylabel or metric)
 
             if args.xlim:

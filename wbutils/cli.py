@@ -34,6 +34,58 @@ def parse_filters(filter_args: list[str] | None) -> dict[str, list[str]]:
     return filters
 
 
+def get_nested_value(d: dict, key: str):
+    """
+    Get a value from a nested dict using dot notation.
+
+    Args:
+        d: Dictionary to search
+        key: Key with optional dot notation (e.g., "agent.tau" or "env_name")
+
+    Returns:
+        Value if found, None otherwise
+    """
+    if not d or not key:
+        return None
+
+    # Try direct key first (handles keys that literally contain dots)
+    if key in d:
+        return d[key]
+
+    # Try nested access
+    if "." in key:
+        parts = key.split(".")
+        current = d
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return None
+        return current
+
+    return None
+
+
+def get_all_config_keys(config: dict, prefix: str = "") -> set[str]:
+    """
+    Get all keys from a config dict, including nested keys with dot notation.
+
+    Args:
+        config: Config dictionary
+        prefix: Current key prefix for recursion
+
+    Returns:
+        Set of all keys (e.g., {"env_name", "agent.tau", "agent.lr"})
+    """
+    keys = set()
+    for k, v in config.items():
+        full_key = f"{prefix}.{k}" if prefix else k
+        keys.add(full_key)
+        if isinstance(v, dict):
+            keys.update(get_all_config_keys(v, full_key))
+    return keys
+
+
 def apply_filters(
     runs: list, filters: dict[str, list[str]], show_debug_on_empty: bool = True
 ) -> list:
@@ -43,6 +95,7 @@ def apply_filters(
     Args:
         runs: List of CachedRun objects
         filters: Dict mapping key -> list of acceptable values (AND between keys, OR within values)
+                 Keys support dot notation for nested access (e.g., "agent.tau")
         show_debug_on_empty: Show debug info if no runs match
 
     Returns:
@@ -56,7 +109,7 @@ def apply_filters(
         config = run.config if isinstance(run.config, dict) else {}
         match = True
         for key, values in filters.items():
-            run_value = config.get(key)
+            run_value = get_nested_value(config, key)
             # Convert to string for comparison
             run_value_str = str(run_value) if run_value is not None else None
             if run_value_str not in values:
@@ -75,24 +128,24 @@ def apply_filters(
             missing_count = 0
             for run in runs:
                 config = run.config if isinstance(run.config, dict) else {}
-                if key in config:
-                    val = config[key]
-                    actual_values.add(str(val) if val is not None else None)
+                val = get_nested_value(config, key)
+                if val is not None:
+                    actual_values.add(str(val))
                 else:
                     missing_count += 1
 
             if missing_count == len(runs):
                 print(f"  {key}: KEY NOT FOUND in any run config")
-                # Suggest similar keys
+                # Suggest similar keys (including nested)
                 all_keys = set()
                 for run in runs:
                     config = run.config if isinstance(run.config, dict) else {}
-                    all_keys.update(config.keys())
+                    all_keys.update(get_all_config_keys(config))
                 similar = [
                     k for k in all_keys if key.lower() in k.lower() or k.lower() in key.lower()
                 ]
                 if similar:
-                    print(f"    Similar keys: {similar}")
+                    print(f"    Similar keys: {sorted(similar)[:5]}")
             else:
                 actual_list = sorted([v for v in actual_values if v is not None])[:10]
                 print(f"  {key}: filter={filter_values}")
